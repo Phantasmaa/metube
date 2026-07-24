@@ -32,3 +32,7 @@ downloads/
 .DS_Store
 Thumbs.db
 bgutil-pot*
+
+# MeTube state files
+completed.json
+queue.json
