@@ -1141,14 +1141,26 @@ async def setup_page(request):
             pass
 
     has_chrome_session = False
+    yt_tab_count = 0
     try:
         import urllib.request, json as _json
         tabs = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json', timeout=2).read())
-        has_chrome_session = any(
-            'youtube.com' in (t.get('url') or '') or
-            'accounts.google.com' in (t.get('url') or '')
-            for t in tabs if t.get('type') == 'page'
+        page_tabs = [t for t in tabs if t.get('type') == 'page']
+        yt_tab_count = sum(
+            1 for t in page_tabs
+            if any(s in (t.get('url') or '')
+                   for s in ['youtube.com', 'accounts.google.com'])
         )
+        # has_chrome_session is only True if Chrome is logged in, otherwise
+        # the button triggers a clear error when clicked.
+        for t in page_tabs:
+            url = (t.get('url') or '')
+            if 'youtube.com' in url and '/signin' not in url:
+                # Could be homepage; we treat any non-signin youtube tab as
+                # "session may exist" — actual cookie count is checked at
+                # extract-time.
+                has_chrome_session = True
+                break
     except Exception:
         pass
 
@@ -1211,24 +1223,18 @@ async def setup_page(request):
   <p style="font-size:12px;opacity:0.7">Max 1MB. File is saved as <code>/root/metube/cookies.txt</code> (chmod 600).</p>
 </div>
 
-<div class="card" id="auto-extract-card" style="display:{('none' if has_chrome_session else 'block')}">
-  <h2 style="margin-top:0">②b Or auto-extract from the persistent Chromium</h2>
-  <p>The persistent Chromium in <code>/root/.browser-login/chrome-profile</code> is currently without a YouTube session. <b>To enable this fast path:</b></p>
+<div class="card" id="auto-extract-card">
+  <h2 style="margin-top:0">②b Auto-extract from the persistent Chromium</h2>
+  <p>The persistent Chromium in <code>/root/.browser-login/chrome-profile</code> runs an open browser session. <b>To use this:</b></p>
   <ol>
-    <li>Open <a href="http://173.249.3.113:6080/vnc.html" target="_blank" style="color:#c5a3ff">noVNC</a> (the browser login server) in your PC browser.</li>
-    <li>Click <b>Connect</b>, log into YouTube, close the noVNC tab.</li>
+    <li>Open <a href="http://173.249.3.113:6080/vnc.html" target="_blank" style="color:#c5a3ff">noVNC</a> in your PC browser.</li>
+    <li>Click <b>Connect</b>, sign into YouTube if not logged in, then close the noVNC tab.</li>
     <li>Come back here and click the button below.</li>
   </ol>
+  <p>Current detection: <span class="pill {'pill-ok' if has_chrome_session else 'pill-no'}">{'✅ YouTube tab + cookies expected' if has_chrome_session else '⚠ no YouTube session detected — log in first'}</span></p>
   <button onclick="autoExtract()" class="btn btn-secondary">🪄 Auto-extract cookies from Chrome</button>
   <p id="auto-extract-result" style="margin-top:12px;font-size:13px"></p>
-  <p style="font-size:12px;opacity:0.7">Uses Chrome DevTools Protocol — works only when Chrome has an active YouTube session.</p>
-</div>
-
-<div class="card" style="display:{('block' if has_chrome_session else 'none')}">
-  <h2 style="margin-top:0">②c Auto-extract (button)</h2>
-  <p>✅ Persistent Chromium has a YouTube session — pull cookies in one click:</p>
-  <button onclick="autoExtract()" class="btn">🪄 Auto-extract from Chrome</button>
-  <p id="auto-extract-result-2" style="margin-top:12px;font-size:13px"></p>
+  <p style="font-size:12px;opacity:0.7">Uses Chrome DevTools Protocol. The button always responds with the result, even on failure.</p>
 </div>
 
 <script>
@@ -1236,8 +1242,8 @@ function autoExtract() {{
   const els = document.querySelectorAll('#auto-extract-result, #auto-extract-result-2');
   els.forEach(e => e.textContent = '⏳ Extracting from Chromium...');
   fetch('/setup/auto-extract', {{ method: 'POST' }})
-    .then(r => r.json().then(j => ({{ return {{ status: r.status, body: j }} }})))
-    .then({{ status, body }}) => {{
+    .then(r => r.json().then(j => ({{ status: r.status, body: j }})))
+    .then(({{ status, body }}) => {{
       if (status === 200 && body.status === 'ok') {{
         els.forEach(e => e.innerHTML = '✅ ' + body.msg + ' — <a href="/" style="color:#c5a3ff">back to app</a>');
         setTimeout(() => location.reload(), 1500);
