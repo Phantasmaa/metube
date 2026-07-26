@@ -17,7 +17,7 @@ import json
 import pathlib
 import re
 import time
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse, quote
 from watchfiles import DefaultFilter, Change, awatch
 
 import bg_tasks
@@ -1532,6 +1532,47 @@ if config.URL_PREFIX != '/':
 routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX, os.path.join(config.BASE_DIR, 'ui/dist/metube/browser'))
+
+# Force-download endpoint: same files as /download/ and /audio_download/ but
+# with Content-Disposition: attachment so mobile browsers (Android Chrome
+# opens .m4a/.mp4 in the player instead of saving them) actually save to disk.
+# Query: ?type=audio|video (default: detect from path or filename).
+@routes.get(config.URL_PREFIX + 'api/file/{tail:.*}')
+async def force_download(request):
+    tail = request.match_info['tail']
+    qtype = request.query.get('type', '').lower()
+    if qtype == 'audio':
+        base = config.AUDIO_DOWNLOAD_DIR
+    elif qtype == 'video':
+        base = config.DOWNLOAD_DIR
+    else:
+        # Auto-detect: if tail starts with "audio/" or file ext is in audio list, use audio dir.
+        audio_exts = {'.m4a', '.mp3', '.opus', '.wav', '.flac'}
+        if tail.startswith('audio/') or os.path.splitext(tail)[1].lower() in audio_exts:
+            base = config.AUDIO_DOWNLOAD_DIR
+        else:
+            base = config.DOWNLOAD_DIR
+    # Strip the optional "audio/" prefix because AUDIO_DOWNLOAD_DIR already points there.
+    rel = tail
+    if base == config.AUDIO_DOWNLOAD_DIR and rel.startswith('audio/'):
+        rel = rel[len('audio/'):]
+    # Sanitize: prevent path traversal outside base.
+    target = os.path.realpath(os.path.join(base, rel))
+    base_real = os.path.realpath(base)
+    if not (target == base_real or target.startswith(base_real + os.sep)):
+        raise web.HTTPNotFound()
+    if not os.path.isfile(target):
+        raise web.HTTPNotFound()
+    filename = os.path.basename(target)
+    response = web.FileResponse(target)
+    # RFC 5987 — filename* for non-ASCII, fallback to filename=
+    safe_ascii = filename.encode('ascii', 'replace').decode('ascii').replace('?', '_')
+    response.headers['Content-Disposition'] = (
+        f'attachment; filename="{safe_ascii}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return response
+
 try:
     app.add_routes(routes)
 except ValueError as e:

@@ -1245,16 +1245,15 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   buildDownloadLink(download: Download) {
-    let baseDir = this.downloads.configuration["PUBLIC_HOST_URL"];
-    if (download.download_type === 'audio' || download.filename.endsWith('.mp3')) {
-      baseDir = this.downloads.configuration["PUBLIC_HOST_AUDIO_URL"];
-    }
-
-    if (download.folder) {
-      baseDir += this.encodeFolderPath(download.folder);
-    }
-
-    return baseDir + encodeURIComponent(download.filename);
+    // Use /api/file/* which forces Content-Disposition: attachment.
+    // Without this, mobile browsers (Android Chrome) open audio/video files
+    // in their built-in player instead of saving them to disk.
+    const isAudio = download.download_type === 'audio' || download.filename.endsWith('.mp3');
+    const folderPart = download.folder ? this.encodeFolderPath(download.folder) : '';
+    const filePart = encodeURIComponent(download.filename);
+    const typeParam = isAudio ? '?type=audio' : '?type=video';
+    // Strip leading "/" from folderPart since the route already ends with /
+    return `api/file/${folderPart}${filePart}${typeParam}`;
   }
 
   // Web Share API support — primarily for iOS Safari / Chrome, lets the user
