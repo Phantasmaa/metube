@@ -869,6 +869,12 @@ async def add(request):
     except web.HTTPBadRequest as e:
         log.error("Bad request: %s", e.reason)
         raise
+    # Silently refresh YouTube cookies from the persistent Chromium if the
+    # URL is a YouTube link. YouTube rotates cookies when it sees them used
+    # from a datacenter IP, so the file we extracted an hour ago is usually
+    # invalid by now. The refresh is a no-op on non-YouTube URLs and on
+    # unreachable Chromium — failure here never blocks the user's add.
+    await _maybe_refresh_youtube_cookies(o['url'])
     log.info(
         "Add download request: type=%s quality=%s format=%s has_folder=%s auto_start=%s",
         o['download_type'],
@@ -1282,46 +1288,53 @@ function autoExtract() {{
 
 @routes.post(config.URL_PREFIX + 'setup/auto-extract')
 async def setup_auto_extract(request):
-    """Pull cookies from the persistent Chromium (CDP) → /root/metube/cookies.txt.
+    """Pull cookies from the persistent Chromium (CDP) → STATE_DIR/cookies.txt.
 
-    Returns 200 with a JSON status. If the Chromium isn't running or has no
-    YouTube session, returns 409 / empty object so the UI can surface the
-    reason.
+    Wrapper around _refresh_cookies_from_chrome() that maps the helper's
+    (count, err) tuple to the JSON shape the UI expects.
     """
-    import urllib.request, json as _json, asyncio
-    try:
-        tabs_raw = urllib.request.urlopen('http://127.0.0.1:9222/json', timeout=3).read()
-    except Exception as exc:
-        return web.Response(status=503, text=serializer.encode({'status': 'error', 'msg': f'Chromium DevTools not reachable: {exc}'}))
+    count, err = await _refresh_cookies_from_chrome()
+    if count > 0:
+        return web.Response(text=serializer.encode({
+            'status': 'ok',
+            'cookies_extracted': count,
+            'cookies_bytes': os.path.getsize(COOKIES_PATH),
+            'msg': f'Extracted {count} cookies. MeTube loaded them — try downloading again.',
+        }))
+    # Surface the failure reason in the UI
+    code = 503 if 'unreachable' in err else 409
+    return web.Response(status=code, text=serializer.encode({
+        'status': 'error',
+        'msg': err or 'no cookies extracted',
+    }))
 
+
+async def _refresh_cookies_from_chrome():
+    """Best-effort: pull fresh YouTube/Google cookies from the persistent
+    Chromium via CDP and overwrite STATE_DIR/cookies.txt. Returns
+    (count, error_msg). If Chromium is unreachable or has no YT session,
+    returns (0, reason) without raising — the caller falls back to the
+    existing cookies file."""
+    import urllib.request as _ur
+    import websockets as _ws
     try:
-        tabs = _json.loads(tabs_raw)
-    except Exception:
-        return web.Response(status=503, text=serializer.encode({'status': 'error', 'msg': 'Could not parse Chromium tabs'}))
+        tabs_raw = _ur.urlopen('http://127.0.0.1:9222/json', timeout=3).read()
+        tabs = json.loads(tabs_raw)
+    except Exception as exc:
+        return 0, f'Chromium DevTools not reachable: {exc}'
 
     page_tabs = [t for t in tabs if t.get('type') == 'page' and t.get('webSocketDebuggerUrl')]
     if not page_tabs:
-        return web.Response(status=409, text=serializer.encode({'status': 'error', 'msg': 'No Chromium tabs open'}))
+        return 0, 'No Chromium tabs open'
 
-    try:
-        import websockets
-    except ImportError:
-        return web.Response(status=500, text=serializer.encode({'status': 'error', 'msg': 'websockets module not installed in metube venv'}))
-
-    all_cookies = []
-    # We try a single WebSocket against the first page tab that has an
-    # open YouTube / Google URL (the most likely to have a logged-in
-    # session) and ask for cookies across all the YT/Google scopes we
-    # care about. Re-using the socket keeps the round-trip cheap.
+    # Prefer a tab on YouTube/Google (logged-in); fall back to any page tab.
     target_tab = None
     for tab in page_tabs:
-        url = tab.get('url', '') or ''
+        url = (tab.get('url') or '')
         if any(s in url for s in ['youtube.com', 'google.com']) and '/signin' not in url and '/ServiceLogin' not in url:
             target_tab = tab
             break
-    if target_tab is None and page_tabs:
-        # Fallback: take the first tab at all (e.g. cookie storage shared
-        # across all tabs anyway).
+    if target_tab is None:
         target_tab = page_tabs[0]
 
     cookie_target_urls = [
@@ -1330,75 +1343,88 @@ async def setup_auto_extract(request):
         'https://accounts.google.com',
         'https://youtube.com',
     ]
-    if target_tab:
-        ws_url = target_tab['webSocketDebuggerUrl']
-        try:
-            async with websockets.connect(ws_url, max_size=2*1024*1024) as ws:
-                for i, target_url in enumerate(cookie_target_urls):
-                    await ws.send(_json.dumps({'id': 1 + i, 'method': 'Network.getCookies', 'params': {'urls': [target_url]}}))
-                for i in range(len(cookie_target_urls)):
-                    resp_text = await asyncio.wait_for(ws.recv(), timeout=15)
-                    resp = _json.loads(resp_text)
-                    cookies = resp.get('result', {}).get('cookies', [])
-                    all_cookies.extend(cookies)
-        except Exception as exc:
-            log.warning(f'CDP {target_tab.get("url","")[:50]}: {exc}')
 
-    # Dedupe by (name, domain, path) - cookies appear in multiple URL fetches
-    seen = set()
-    deduped = []
+    all_cookies = []
+    try:
+        async with _ws.connect(target_tab['webSocketDebuggerUrl'], max_size=2*1024*1024, open_timeout=5) as ws:
+            for i, target_url in enumerate(cookie_target_urls):
+                await ws.send(json.dumps({'id': 1 + i, 'method': 'Network.getCookies', 'params': {'urls': [target_url]}}))
+            for i in range(len(cookie_target_urls)):
+                resp_text = await asyncio.wait_for(ws.recv(), timeout=10)
+                resp = json.loads(resp_text)
+                cookies = resp.get('result', {}).get('cookies', [])
+                all_cookies.extend(cookies)
+    except Exception as exc:
+        return 0, f'CDP error: {exc}'
+
+    # Dedupe by (name, domain, path)
+    seen, deduped = set(), []
     for c in all_cookies:
         key = (c.get('name', ''), c.get('domain', ''), c.get('path', '/'))
         if key not in seen:
             seen.add(key)
             deduped.append(c)
-    all_cookies = deduped
 
-    yt = [c for c in all_cookies if any(
+    yt = [c for c in deduped if any(
         d in c.get('domain', '')
         for d in ['youtube.com', 'google.com', 'googleapis.com', 'gstatic.com', 'youtu.be']
     )]
-
     if not yt:
-        return web.Response(status=409, text=serializer.encode({
-            'status': 'error',
-            'msg': 'No YouTube/Google cookies in Chromium. Log into YouTube first via noVNC, then retry.',
-        }))
+        return 0, 'No YouTube/Google cookies in Chromium. Log into YouTube first via noVNC, then retry.'
 
     lines = [
         '# Netscape HTTP Cookie File',
-        '# Auto-extracted by MeTube /setup/auto-extract',
+        '# Auto-refreshed from Chromium by MeTube',
         '# https://curl.haxx.se/rfc/cookie-spec.html',
         '',
     ]
     for c in yt:
         domain = c['domain']
-        if not domain.startswith('.'):
-            flag = 'FALSE'
-        else:
-            flag = 'TRUE'
+        flag = 'FALSE' if not domain.startswith('.') else 'TRUE'
         path = c.get('path', '/')
         secure = 'TRUE' if c.get('secure') else 'FALSE'
         expires = c.get('expires', 0) or 0
         if isinstance(expires, float):
             expires = int(expires)
-        name = c['name']
-        value = c['value']
-        lines.append(f'{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}')
+        lines.append(f'{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{c["name"]}\t{c["value"]}')
 
     body = '\n'.join(lines) + '\n'
-    tmp = f'{COOKIES_PATH}.tmp'
-    with open(tmp, 'w') as f:
-        f.write(body)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, COOKIES_PATH)
-    log.info(f'Auto-extracted {len(yt)} cookies from Chromium to {COOKIES_PATH}')
-    return web.Response(text=serializer.encode({
-        'status': 'ok',
-        'cookies_extracted': len(yt),
-        'cookies_bytes': os.path.getsize(COOKIES_PATH),
-        'msg': f'Extracted {len(yt)} cookies. MeTube loaded them — try downloading again.',
-    }))
+    try:
+        tmp = f'{COOKIES_PATH}.tmp'
+        with open(tmp, 'w') as f:
+            f.write(body)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, COOKIES_PATH)
+        log.info(f'Auto-extracted {len(yt)} cookies from Chromium to {COOKIES_PATH}')
+    except Exception as exc:
+        return 0, f'write failed: {exc}'
+    return len(yt), ''
+
+
+async def _maybe_refresh_youtube_cookies(url: str) -> None:
+    """Silently refresh cookies if the URL is YouTube and we have a Chromium
+    profile to pull from. YouTube rotates cookies when it sees them used from
+    a datacenter IP, so the file we extracted an hour ago is often invalid by
+    the time the user clicks download. This fetches a fresh copy from the
+    logged-in Chromium before each YouTube download. Non-YouTube URLs and
+    unreachable Chromium are silent no-ops."""
+    if not url:
+        return
+    is_yt = any(s in url for s in ['youtube.com', 'youtu.be'])
+    if not is_yt:
+        return
+    # Cheap TCP probe — saves ~3s on every non-YouTube request.
+    try:
+        import socket as _s
+        with _s.create_connection(('127.0.0.1', 9222), timeout=0.5):
+            pass
+    except OSError:
+        return
+    count, err = await _refresh_cookies_from_chrome()
+    if count > 0:
+        log.info(f'Auto-refreshed {count} YouTube cookies before download')
+    elif err:
+        log.debug(f'Cookie auto-refresh skipped: {err}')
 
 
 
