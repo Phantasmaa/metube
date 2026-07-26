@@ -163,6 +163,11 @@ class Config:
             auto_cookies = os.path.join(self.STATE_DIR, 'cookies.txt')
             if os.path.exists(auto_cookies) and os.path.getsize(auto_cookies) > 50:
                 self._runtime_overrides['cookiefile'] = auto_cookies
+                # Also force the JS challenge solver and remote EJS
+                # components — required on datacenter IPs because the
+                # default client can't satisfy YouTube's JS challenges
+                # without them.
+                self._runtime_overrides.setdefault('remote_components', ['ejs:github'])
                 self._apply_runtime_overrides()
                 log.info(f'Auto-loaded cookies from {auto_cookies} ({os.path.getsize(auto_cookies)} bytes)')
         except Exception as e:
@@ -1059,8 +1064,12 @@ async def upload_cookies(request):
         log.warning(f'Could not restrict permissions on cookies file: {exc}')
     os.replace(tmp_cookie_path, COOKIES_PATH)
     config.set_runtime_override('cookiefile', COOKIES_PATH)
+    # Pair with the EJS remote components so YouTube JS challenges solve
+    # on datacenter IPs. cookies alone are not enough in 2026.
+    config._runtime_overrides.setdefault('remote_components', ['ejs:github'])
+    config._apply_runtime_overrides()
     log.info(f'Cookies file uploaded ({size} bytes)')
-    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes)'}))
+    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes) — EJS solver armed, try again'}))
 
 @routes.post(config.URL_PREFIX + 'delete-cookies')
 async def delete_cookies(request):
@@ -1300,18 +1309,50 @@ async def setup_auto_extract(request):
         return web.Response(status=500, text=serializer.encode({'status': 'error', 'msg': 'websockets module not installed in metube venv'}))
 
     all_cookies = []
+    # We try a single WebSocket against the first page tab that has an
+    # open YouTube / Google URL (the most likely to have a logged-in
+    # session) and ask for cookies across all the YT/Google scopes we
+    # care about. Re-using the socket keeps the round-trip cheap.
+    target_tab = None
     for tab in page_tabs:
-        ws_url = tab['webSocketDebuggerUrl']
+        url = tab.get('url', '') or ''
+        if any(s in url for s in ['youtube.com', 'google.com']) and '/signin' not in url and '/ServiceLogin' not in url:
+            target_tab = tab
+            break
+    if target_tab is None and page_tabs:
+        # Fallback: take the first tab at all (e.g. cookie storage shared
+        # across all tabs anyway).
+        target_tab = page_tabs[0]
+
+    cookie_target_urls = [
+        'https://www.youtube.com',
+        'https://accounts.youtube.com',
+        'https://accounts.google.com',
+        'https://youtube.com',
+    ]
+    if target_tab:
+        ws_url = target_tab['webSocketDebuggerUrl']
         try:
             async with websockets.connect(ws_url, max_size=2*1024*1024) as ws:
-                await ws.send(_json.dumps({'id': 1, 'method': 'Network.getCookies', 'params': {'urls': []}}))
-                resp_text = await asyncio.wait_for(ws.recv(), timeout=10)
-                resp = _json.loads(resp_text)
-                cookies = resp.get('result', {}).get('cookies', [])
-                all_cookies.extend(cookies)
+                for i, target_url in enumerate(cookie_target_urls):
+                    await ws.send(_json.dumps({'id': 1 + i, 'method': 'Network.getCookies', 'params': {'urls': [target_url]}}))
+                for i in range(len(cookie_target_urls)):
+                    resp_text = await asyncio.wait_for(ws.recv(), timeout=15)
+                    resp = _json.loads(resp_text)
+                    cookies = resp.get('result', {}).get('cookies', [])
+                    all_cookies.extend(cookies)
         except Exception as exc:
-            log.warning(f'CDP {tab.get("url","")}: {exc}')
-            continue
+            log.warning(f'CDP {target_tab.get("url","")[:50]}: {exc}')
+
+    # Dedupe by (name, domain, path) - cookies appear in multiple URL fetches
+    seen = set()
+    deduped = []
+    for c in all_cookies:
+        key = (c.get('name', ''), c.get('domain', ''), c.get('path', '/'))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    all_cookies = deduped
 
     yt = [c for c in all_cookies if any(
         d in c.get('domain', '')
