@@ -36,3 +36,7 @@ bgutil-pot*
 # MeTube state files
 completed.json
 queue.json
+
+# Local cookies cache (never commit credentials)
+cookies.txt
+cookies.txt.*

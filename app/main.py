@@ -153,6 +153,20 @@ class Config:
         success,_ = self.load_ytdl_options()
         if not success:
             sys.exit(1)
+
+        # Auto-load cookies.txt from STATE_DIR on boot if present.
+        # Background: YouTube blocks download requests from datacenter IPs
+        # unless the request carries human cookies. Without this, MeTube
+        # silently fails with "Sign in to confirm you're not a bot" for
+        # ~every video. Users drop cookies.txt here via the /setup endpoint.
+        try:
+            auto_cookies = os.path.join(self.STATE_DIR, 'cookies.txt')
+            if os.path.exists(auto_cookies) and os.path.getsize(auto_cookies) > 50:
+                self._runtime_overrides['cookiefile'] = auto_cookies
+                self._apply_runtime_overrides()
+                log.info(f'Auto-loaded cookies from {auto_cookies} ({os.path.getsize(auto_cookies)} bytes)')
+        except Exception as e:
+            log.warning(f'Could not auto-load cookies: {e}')
         success,_ = self.load_ytdl_option_presets()
         if not success:
             sys.exit(1)
@@ -1081,7 +1095,265 @@ async def cookie_status(request):
     has_configured_cookies = isinstance(configured_cookiefile, str) and os.path.exists(configured_cookiefile)
     has_uploaded_cookies = os.path.exists(COOKIES_PATH)
     exists = has_uploaded_cookies or has_configured_cookies
-    return web.Response(text=serializer.encode({'status': 'ok', 'has_cookies': exists}))
+    bytes_n = os.path.getsize(COOKIES_PATH) if has_uploaded_cookies else 0
+    line_count = 0
+    if has_uploaded_cookies:
+        with open(COOKIES_PATH, 'r', errors='replace') as f:
+            for line in f:
+                if line.strip() and not line.startswith('#') and not line.startswith('//'):
+                    line_count += 1
+    return web.Response(text=serializer.encode({
+        'status': 'ok',
+        'has_cookies': exists,
+        'cookies_path': COOKIES_PATH,
+        'cookies_bytes': bytes_n,
+        'cookie_lines': line_count,
+        'bgutil_pot_server': 'http://127.0.0.1:4416',
+    }))
+
+
+@routes.get(config.URL_PREFIX + 'setup')
+async def setup_page(request):
+    """YouTube cookies setup wizard — open in browser, follow steps, then download.
+
+    Background: MeTube lives on a datacenter IP. YouTube blocks downloads
+    with a "Sign in to confirm you're not a bot" wall unless the request
+    carries human cookies. This page guides the user through exporting /
+    re-uploading cookies without SSH.
+    """
+    status_q = request.query.get('status', '')
+    msg = ''
+    if status_q == 'ok':
+        msg = '<div style="background:#1b5e20;color:#fff;padding:12px 18px;border-radius:6px;margin:14px 0;">✅ Cookies saved. Restart metube to apply — return here after and click <b>Test download</b>.</div>'
+    elif status_q == 'fail':
+        msg = '<div style="background:#b71c1c;color:#fff;padding:12px 18px;border-radius:6px;margin:14px 0;">❌ Save failed. Check file (must be Netscape format, &lt;1MB).</div>'
+
+    has_cookies = os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 50
+    cookies_bytes = os.path.getsize(COOKIES_PATH) if os.path.exists(COOKIES_PATH) else 0
+    cookie_lines = 0
+    if os.path.exists(COOKIES_PATH):
+        try:
+            with open(COOKIES_PATH, 'r', errors='replace') as f:
+                for line in f:
+                    if line.strip() and not line.startswith('#') and not line.startswith('//'):
+                        cookie_lines += 1
+        except Exception:
+            pass
+
+    has_chrome_session = False
+    try:
+        import urllib.request, json as _json
+        tabs = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json', timeout=2).read())
+        has_chrome_session = any(
+            'youtube.com' in (t.get('url') or '') or
+            'accounts.google.com' in (t.get('url') or '')
+            for t in tabs if t.get('type') == 'page'
+        )
+    except Exception:
+        pass
+
+    body = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeTube · YouTube cookies setup</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, sans-serif; background:#1a1a2e; color:#e0e0e0; padding:24px; margin:0; max-width:820px; }}
+  h1 {{ color:#9f7aea; margin-top:0; }}
+  h2 {{ color:#c5a3ff; margin-top:32px; }}
+  .card {{ background:#25254a; border-radius:8px; padding:18px 22px; margin-bottom:18px; }}
+  code, pre {{ background:#0d0c1f; padding:8px 12px; border-radius:4px; display:block; overflow-x:auto; font-size:13px; color:#a3ffaa; }}
+  b {{ color:#c5a3ff; }}
+  ol, ul {{ line-height:1.7; }}
+  button, .btn {{ background:#6c4cd1; color:#fff; border:none; border-radius:6px; padding:10px 20px; cursor:pointer; font-size:14px; text-decoration:none; display:inline-block; margin:6px 6px 6px 0; }}
+  button:hover, .btn:hover {{ background:#7d5fe0; }}
+  .btn-secondary {{ background:#3c3c5c; }}
+  input[type=file] {{ background:#1a1a2e; color:#e0e0e0; padding:8px; border-radius:4px; border:1px solid #3c3c5c; width:100%; box-sizing:border-box; }}
+  .pill {{ display:inline-block; padding:4px 12px; border-radius:999px; font-size:12px; margin-right:6px; }}
+  .pill-ok {{ background:#1b5e20; color:#fff; }}
+  .pill-no {{ background:#b71c1c; color:#fff; }}
+  .pill-info {{ background:#1e3a5e; color:#fff; }}
+</style>
+</head>
+<body>
+<h1>🎬 MeTube · YouTube cookies setup</h1>
+<p>MeTube lives on a datacenter IP, so YouTube blocks most downloads. To unlock it you need to drop in a <code>cookies.txt</code> exported from a browser that's logged into YouTube. Once set, ALL platforms work — TikTok, Instagram, Vimeo, X, Reddit, SoundCloud, Facebook, 1800+ sites.</p>
+
+{msg}
+
+<div class="card">
+  <h2 style="margin-top:0">Status</h2>
+  <p>
+    <span class="pill {'pill-ok' if has_cookies else 'pill-no'}">{'✅ cookies.txt loaded' if has_cookies else '❌ no cookies'}</span>
+    <span class="pill pill-info">{cookies_bytes} bytes · {cookie_lines} lines</span>
+    <span class="pill {'pill-ok' if has_chrome_session else 'pill-no'}">{'✅ Chrome has YouTube session' if has_chrome_session else '⚠ no YouTube session in Chrome'}</span>
+    <span class="pill pill-info">bgutil-pot ✓</span>
+  </p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">① Export cookies from your browser</h2>
+  <p>On the <b>device where you're already logged into YouTube</b> (PC, phone, laptop):</p>
+  <ul>
+    <li><b>Chrome / Edge</b>: install <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/gcaljgpkililimdifakkbboccancnbegi" target="_blank" style="color:#c5a3ff">Get cookies.txt LOCALLY</a> (by ghomasjich). Open YouTube, click the extension → <b>Export cookies for this site</b> → save as <code>cookies.txt</code>.</li>
+    <li><b>Firefox</b>: install the <a href="https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/" target="_blank" style="color:#c5a3ff">cookies.txt</a> add-on. Same export flow.</li>
+    <li><b>Android</b>: use <a href="https://play.google.com/store/apps/details?id=jp.co.taffs.cookiestxt" target="_blank" style="color:#c5a3ff">cookies.txt exporter</a> with Kiwi Browser.</li>
+  </ul>
+  <p><b>Tip:</b> log into YouTube fresh, then export immediately. Cookies expire (~30 days).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">② Upload cookies.txt here</h2>
+  <form action="/upload-cookies" method="post" enctype="multipart/form-data">
+    <input type="file" name="cookies" accept=".txt" required>
+    <button type="submit" style="margin-top:12px">📤 Upload cookies.txt</button>
+  </form>
+  <p style="font-size:12px;opacity:0.7">Max 1MB. File is saved as <code>/root/metube/cookies.txt</code> (chmod 600).</p>
+</div>
+
+<div class="card" id="auto-extract-card" style="display:{('none' if has_chrome_session else 'block')}">
+  <h2 style="margin-top:0">②b Or auto-extract from the persistent Chromium</h2>
+  <p>The persistent Chromium in <code>/root/.browser-login/chrome-profile</code> is currently without a YouTube session. <b>To enable this fast path:</b></p>
+  <ol>
+    <li>Open <a href="http://173.249.3.113:6080/vnc.html" target="_blank" style="color:#c5a3ff">noVNC</a> (the browser login server) in your PC browser.</li>
+    <li>Click <b>Connect</b>, log into YouTube, close the noVNC tab.</li>
+    <li>Come back here and click the button below.</li>
+  </ol>
+  <button onclick="autoExtract()" class="btn btn-secondary">🪄 Auto-extract cookies from Chrome</button>
+  <p id="auto-extract-result" style="margin-top:12px;font-size:13px"></p>
+  <p style="font-size:12px;opacity:0.7">Uses Chrome DevTools Protocol — works only when Chrome has an active YouTube session.</p>
+</div>
+
+<div class="card" style="display:{('block' if has_chrome_session else 'none')}">
+  <h2 style="margin-top:0">②c Auto-extract (button)</h2>
+  <p>✅ Persistent Chromium has a YouTube session — pull cookies in one click:</p>
+  <button onclick="autoExtract()" class="btn">🪄 Auto-extract from Chrome</button>
+  <p id="auto-extract-result-2" style="margin-top:12px;font-size:13px"></p>
+</div>
+
+<script>
+function autoExtract() {{
+  const els = document.querySelectorAll('#auto-extract-result, #auto-extract-result-2');
+  els.forEach(e => e.textContent = '⏳ Extracting from Chromium...');
+  fetch('/setup/auto-extract', {{ method: 'POST' }})
+    .then(r => r.json().then(j => ({{ return {{ status: r.status, body: j }} }})))
+    .then({{ status, body }}) => {{
+      if (status === 200 && body.status === 'ok') {{
+        els.forEach(e => e.innerHTML = '✅ ' + body.msg + ' — <a href="/" style="color:#c5a3ff">back to app</a>');
+        setTimeout(() => location.reload(), 1500);
+      }} else {{
+        els.forEach(e => e.textContent = '❌ ' + (body.msg || ('HTTP ' + status)));
+      }}
+    }})
+    .catch(e => {{ els.forEach(el => el.textContent = '❌ ' + e.message); }});
+}}
+</script>
+
+<div class="card">
+  <h2 style="margin-top:0">③ Quick test</h2>
+  <p>After upload, go back to <a href="/" style="color:#c5a3ff">the main app</a> and paste a YouTube URL. If it still 500s with "Sign in to confirm you're not a bot", restart MeTube from your SSH session: <code>sudo systemctl restart metube.service</code></p>
+  <p><b>Heads-up:</b> YouTube cookies last ~30 days. When downloads start failing again, re-export.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Alternative platforms</h2>
+  <p>For non-YouTube sites (TikTok, Instagram, Vimeo, X, Reddit, SoundCloud, Facebook), MeTube works without cookies — just paste the URL. The setup above only unlocks YouTube/SoundCloud-Music and other Google-property sites.</p>
+</div>
+
+<p style="text-align:center;margin-top:32px;opacity:0.5;font-size:12px">MeTube setup wizard · open source · <a href="/" style="color:#c5a3ff">← back to app</a></p>
+</body></html>"""
+    return web.Response(text=body, content_type='text/html')
+
+
+@routes.post(config.URL_PREFIX + 'setup/auto-extract')
+async def setup_auto_extract(request):
+    """Pull cookies from the persistent Chromium (CDP) → /root/metube/cookies.txt.
+
+    Returns 200 with a JSON status. If the Chromium isn't running or has no
+    YouTube session, returns 409 / empty object so the UI can surface the
+    reason.
+    """
+    import urllib.request, json as _json, asyncio
+    try:
+        tabs_raw = urllib.request.urlopen('http://127.0.0.1:9222/json', timeout=3).read()
+    except Exception as exc:
+        return web.Response(status=503, text=serializer.encode({'status': 'error', 'msg': f'Chromium DevTools not reachable: {exc}'}))
+
+    try:
+        tabs = _json.loads(tabs_raw)
+    except Exception:
+        return web.Response(status=503, text=serializer.encode({'status': 'error', 'msg': 'Could not parse Chromium tabs'}))
+
+    page_tabs = [t for t in tabs if t.get('type') == 'page' and t.get('webSocketDebuggerUrl')]
+    if not page_tabs:
+        return web.Response(status=409, text=serializer.encode({'status': 'error', 'msg': 'No Chromium tabs open'}))
+
+    try:
+        import websockets
+    except ImportError:
+        return web.Response(status=500, text=serializer.encode({'status': 'error', 'msg': 'websockets module not installed in metube venv'}))
+
+    all_cookies = []
+    for tab in page_tabs:
+        ws_url = tab['webSocketDebuggerUrl']
+        try:
+            async with websockets.connect(ws_url, max_size=2*1024*1024) as ws:
+                await ws.send(_json.dumps({'id': 1, 'method': 'Network.getCookies', 'params': {'urls': []}}))
+                resp_text = await asyncio.wait_for(ws.recv(), timeout=10)
+                resp = _json.loads(resp_text)
+                cookies = resp.get('result', {}).get('cookies', [])
+                all_cookies.extend(cookies)
+        except Exception as exc:
+            log.warning(f'CDP {tab.get("url","")}: {exc}')
+            continue
+
+    yt = [c for c in all_cookies if any(
+        d in c.get('domain', '')
+        for d in ['youtube.com', 'google.com', 'googleapis.com', 'gstatic.com', 'youtu.be']
+    )]
+
+    if not yt:
+        return web.Response(status=409, text=serializer.encode({
+            'status': 'error',
+            'msg': 'No YouTube/Google cookies in Chromium. Log into YouTube first via noVNC, then retry.',
+        }))
+
+    lines = [
+        '# Netscape HTTP Cookie File',
+        '# Auto-extracted by MeTube /setup/auto-extract',
+        '# https://curl.haxx.se/rfc/cookie-spec.html',
+        '',
+    ]
+    for c in yt:
+        domain = c['domain']
+        if not domain.startswith('.'):
+            flag = 'FALSE'
+        else:
+            flag = 'TRUE'
+        path = c.get('path', '/')
+        secure = 'TRUE' if c.get('secure') else 'FALSE'
+        expires = c.get('expires', 0) or 0
+        if isinstance(expires, float):
+            expires = int(expires)
+        name = c['name']
+        value = c['value']
+        lines.append(f'{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}')
+
+    body = '\n'.join(lines) + '\n'
+    tmp = f'{COOKIES_PATH}.tmp'
+    with open(tmp, 'w') as f:
+        f.write(body)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, COOKIES_PATH)
+    log.info(f'Auto-extracted {len(yt)} cookies from Chromium to {COOKIES_PATH}')
+    return web.Response(text=serializer.encode({
+        'status': 'ok',
+        'cookies_extracted': len(yt),
+        'cookies_bytes': os.path.getsize(COOKIES_PATH),
+        'msg': f'Extracted {len(yt)} cookies. MeTube loaded them — try downloading again.',
+    }))
+
+
 
 @routes.get(config.URL_PREFIX + 'history')
 async def history(request):
