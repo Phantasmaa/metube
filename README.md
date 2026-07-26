@@ -45,6 +45,10 @@ Environment="PORT=8099"
 Environment="HOST=127.0.0.1"
 Environment="DEFAULT_THEME=dark"
 Environment="DOWNLOAD_DIR=/root/metube/downloads"
+# STATE_DIR debe estar SEPARADO de DOWNLOAD_DIR. El middleware `state_dir_guard`
+# rechaza servir cualquier archivo cuyo path real caiga dentro de STATE_DIR
+# (anti-path-traversal). Si se solapan, todos los links de descarga dan 404.
+Environment="STATE_DIR=/root/metube/state"
 ExecStart=/root/metube/.venv/bin/python -m app.main
 Restart=always
 ```
