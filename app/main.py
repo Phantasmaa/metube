@@ -168,8 +168,32 @@ class Config:
                 # default client can't satisfy YouTube's JS challenges
                 # without them.
                 self._runtime_overrides.setdefault('remote_components', ['ejs:github'])
+                # Use YTDLnis-style player clients. The default 'web'
+                # client is the most aggressively rate-limited on
+                # datacenter IPs; web_safari and android_vr are what
+                # YTDLnis (the most actively-maintained Android
+                # downloader) uses by default. Setting these lets yt-dlp
+                # fall back through multiple client signatures instead
+                # of getting blocked on the first one. We only force
+                # these when we have human cookies loaded — without
+                # cookies, non-default clients are worse than the
+                # default.
+                self._runtime_overrides.setdefault('extractor_args', {})
+                yt_args = self._runtime_overrides['extractor_args']
+                if 'youtube' not in yt_args:
+                    yt_args['youtube'] = {}
+                yt_youtube = yt_args['youtube']
+                # Player client order matters: yt-dlp tries them in
+                # sequence and stops on the first that returns formats.
+                # web_safari is what YTDLnis uses first and it accepts
+                # cookies (essential for datacenter IPs). 'web' is the
+                # safest fallback because every other client supports
+                # cookies too. android_vr and similar clients reject
+                # cookie auth and only work anonymously, so we leave
+                # them out of the cookie-auth path.
+                yt_youtube.setdefault('player_client', ['web_safari', 'web'])
                 self._apply_runtime_overrides()
-                log.info(f'Auto-loaded cookies from {auto_cookies} ({os.path.getsize(auto_cookies)} bytes)')
+                log.info(f'Auto-loaded cookies from {auto_cookies} ({os.path.getsize(auto_cookies)} bytes) (player_clients=web_safari,web)')
         except Exception as e:
             log.warning(f'Could not auto-load cookies: {e}')
         success,_ = self.load_ytdl_option_presets()
@@ -1073,9 +1097,20 @@ async def upload_cookies(request):
     # Pair with the EJS remote components so YouTube JS challenges solve
     # on datacenter IPs. cookies alone are not enough in 2026.
     config._runtime_overrides.setdefault('remote_components', ['ejs:github'])
+    # Mirror YTDLnis's default player client selection. Cookies alone
+    # are still rate-limited on the 'web' client; web_safari and
+    # android_vr see much less aggressive throttling and fall back
+    # gracefully if one is blocked.
+    config._runtime_overrides.setdefault('extractor_args', {})
+    yt_args = config._runtime_overrides['extractor_args']
+    yt_args.setdefault('youtube', {})
+    # web_safari accepts cookies (essential for datacenter IPs); 'web'
+    # is a safe fallback. android_vr/ios/etc. don't accept cookies so
+    # we keep them out of the cookie-auth path.
+    yt_args['youtube'].setdefault('player_client', ['web_safari', 'web'])
     config._apply_runtime_overrides()
-    log.info(f'Cookies file uploaded ({size} bytes)')
-    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes) — EJS solver armed, try again'}))
+    log.info(f'Cookies file uploaded ({size} bytes) (player_clients=web_safari,web)')
+    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes) — EJS solver armed + YTDLnis player clients, try again'}))
 
 @routes.post(config.URL_PREFIX + 'delete-cookies')
 async def delete_cookies(request):
