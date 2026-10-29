@@ -4,6 +4,7 @@
 import os
 import sys
 import asyncio
+import aiohttp
 from datetime import datetime, timedelta
 from pathlib import Path
 from aiohttp import web
@@ -24,6 +25,8 @@ import bg_tasks
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
 from yt_dlp.version import __version__ as yt_dlp_version
+from yt_dlp import YoutubeDL
+from url_guard import validate_url
 
 log = logging.getLogger('main')
 
@@ -185,15 +188,13 @@ class Config:
                 yt_youtube = yt_args['youtube']
                 # Player client order matters: yt-dlp tries them in
                 # sequence and stops on the first that returns formats.
-                # web_safari is what YTDLnis uses first and it accepts
-                # cookies (essential for datacenter IPs). 'web' is the
-                # safest fallback because every other client supports
-                # cookies too. android_vr and similar clients reject
-                # cookie auth and only work anonymously, so we leave
-                # them out of the cookie-auth path.
-                yt_youtube.setdefault('player_client', ['web_safari', 'web'])
+                # mweb (YouTube mobile web) is the most reliable against
+                # YouTube's SABR streaming enforcement as of Sep 2026 —
+                # web_safari now triggers SABR which hides format URLs.
+                # web_safari + web kept as fallbacks.
+                yt_youtube.setdefault('player_client', ['mweb', 'web_safari', 'web'])
                 self._apply_runtime_overrides()
-                log.info(f'Auto-loaded cookies from {auto_cookies} ({os.path.getsize(auto_cookies)} bytes) (player_clients=web_safari,web)')
+                log.info(f'Auto-loaded cookies from {auto_cookies} ({os.path.getsize(auto_cookies)} bytes) (player_clients=mweb,web_safari,web)')
         except Exception as e:
             log.warning(f'Could not auto-load cookies: {e}')
         success,_ = self.load_ytdl_option_presets()
@@ -884,6 +885,248 @@ def parse_download_options(post: dict) -> dict:
     }
 
 
+_ANALYSE_LIMIT = asyncio.Semaphore(3)
+_MUSIC_SEARCH_LIMIT = asyncio.Semaphore(2)
+_ANALYSE_TIMEOUT_SECONDS = 25
+_MUSIC_SEARCH_TIMEOUT_SECONDS = 28
+_MUSIC_SEARCH_MAX_RESULTS = 8
+
+
+def _normalize_spotify_track_url(raw_url: str) -> str | None:
+    """Accept only a public Spotify track URL; discard locale and query fragments."""
+    parsed = urlparse(raw_url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != 'https' or parsed.hostname != 'open.spotify.com' or port not in (None, 443) or parsed.username or parsed.password:
+        return None
+    parts = [part for part in parsed.path.split('/') if part]
+    if len(parts) == 3 and parts[0].startswith('intl-'):
+        parts = parts[1:]
+    if len(parts) != 2 or parts[0] != 'track' or not re.fullmatch(r'[A-Za-z0-9]{22}', parts[1]):
+        return None
+    return f'https://open.spotify.com/track/{parts[1]}'
+
+
+def _music_query_from_public_metadata(data: dict, *, allow_author: bool = True) -> tuple[str, str]:
+    title = str(data.get('title') or '').strip()
+    artist = str((data.get('author_name') if allow_author else None) or data.get('artist') or data.get('uploader') or '').strip()
+    if title and artist and title.casefold().endswith((' — ' + artist).casefold()):
+        title = title[:-(len(artist) + 3)].strip()
+    elif title and artist and title.casefold().endswith((' - ' + artist).casefold()):
+        title = title[:-(len(artist) + 3)].strip()
+    return title[:200], artist[:200]
+
+
+async def _spotify_track_artist(track_url: str) -> str:
+    """Read public Spotify track JSON-LD/OG metadata; only a normalized track URL."""
+    timeout = aiohttp.ClientTimeout(total=8, connect=3, sock_read=5)
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; MeTube public metadata lookup)'}
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=False, headers=headers) as session:
+        async with session.get(track_url, allow_redirects=False) as response:
+            if response.status != 200:
+                return ''
+            html = await response.text(errors='replace')
+    for raw in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            by = node.get('byArtist') or node.get('author')
+            if isinstance(by, dict) and by.get('name'):
+                return str(by['name'])[:200]
+            if isinstance(by, list):
+                names = [str(person.get('name')) for person in by if isinstance(person, dict) and person.get('name')]
+                if names:
+                    return ', '.join(names)[:200]
+    # Spotify's public OG description commonly starts with the artist, while
+    # JSON-LD description exposes "Song · ARTIST · YEAR".
+    match = re.search(r'<meta[^>]+(?:name|property)=[\"\']og:description[\"\'][^>]+content=[\"\']([^\"\']+)', html, re.I)
+    if match:
+        description = match.group(1)
+        parts = [part.strip() for part in re.split(r'[·•]', description) if part.strip()]
+        if len(parts) >= 2 and parts[0].lower() in ('song', 'track'):
+            return parts[1][:200]
+        if parts and parts[0].lower() not in ('listen to', 'music'):
+            return parts[0][:200]
+    for match in re.finditer(r'"description"\s*:\s*"((?:\\.|[^"\\])*)"', html):
+        try:
+            description = json.loads('"' + match.group(1) + '"')
+        except ValueError:
+            continue
+        parts = [part.strip() for part in re.split(r'[·•]', description) if part.strip()]
+        if len(parts) >= 3 and parts[0].lower() in ('song', 'track'):
+            return parts[1][:200]
+    return ''
+
+
+async def _public_oembed(url: str, endpoint: str) -> dict:
+    """Fetch only fixed-provider public oEmbed JSON. No URL-controlled host or redirects."""
+    timeout = aiohttp.ClientTimeout(total=8, connect=3, sock_read=5)
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+        async with session.get(endpoint, params={'url': url}, allow_redirects=False) as response:
+            if response.status != 200:
+                raise ValueError(f'oEmbed HTTP {response.status}')
+            data = await response.json(content_type=None)
+            if not isinstance(data, dict):
+                raise ValueError('Invalid oEmbed response')
+            return data
+
+
+def _search_music_candidates(query: str) -> list[dict]:
+    """Use yt-dlp's anonymous SoundCloud search; return bounded, validated candidates."""
+    opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'cookiefile': None,
+            'cookiesfrombrowser': None, 'extract_flat': True, 'noplaylist': True,
+            'socket_timeout': 10, 'retries': 0, 'extractor_retries': 0}
+    with YoutubeDL(opts) as ydl:
+        found = ydl.extract_info(f'scsearch8:{query}', download=False) or {}
+    results = []
+    for entry in found.get('entries') or []:
+        if not isinstance(entry, dict):
+            continue
+        result_url = entry.get('webpage_url') or entry.get('url')
+        if not isinstance(result_url, str):
+            continue
+        parsed = urlparse(result_url)
+        if parsed.scheme != 'https' or parsed.hostname not in ('soundcloud.com', 'www.soundcloud.com'):
+            continue
+        results.append({'title': str(entry.get('title') or 'Sin título')[:200],
+                        'artist': str(entry.get('artist') or entry.get('uploader') or '')[:200],
+                        'duration': entry.get('duration'), 'platform': 'SoundCloud', 'url': result_url})
+        if len(results) >= _MUSIC_SEARCH_MAX_RESULTS:
+            break
+    return results
+
+
+@routes.post(config.URL_PREFIX + 'analyse')
+async def analyse(request):
+    post = await _read_json_request(request)
+    raw_url = post.get('url')
+    if not isinstance(raw_url, str) or not raw_url.strip() or len(raw_url) > 2048:
+        raise web.HTTPBadRequest(reason='Provide a URL of at most 2048 characters')
+    url = raw_url.strip()
+    validation_error = validate_url(url, allow_private=config.ALLOW_PRIVATE_ADDRESSES)
+    if validation_error:
+        raise web.HTTPBadRequest(reason=validation_error)
+
+    def extract_public_metadata():
+        opts = {
+            'quiet': True, 'no_warnings': True, 'skip_download': True,
+            'cookiefile': None, 'cookiesfrombrowser': None,
+            'noplaylist': True, 'socket_timeout': 12, 'retries': 0,
+            'extractor_retries': 0, 'fragment_retries': 0,
+            'paths': {'home': config.DOWNLOAD_DIR, 'temp': config.TEMP_DIR},
+        }
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False) or {}
+
+    try:
+        async with _ANALYSE_LIMIT:
+            info = await asyncio.wait_for(asyncio.to_thread(extract_public_metadata), timeout=_ANALYSE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        raise web.HTTPGatewayTimeout(reason='El análisis tardó demasiado. Intenta de nuevo más tarde.') from exc
+    except Exception as exc:
+        log.info('URL analysis failed for %s: %s', url, str(exc).replace(url, '[submitted URL]'))
+        if 'tiktok' in url.lower():
+            raise web.HTTPBadGateway(reason='TikTok no respondió con metadata compatible en este momento. No se usaron cookies ni se eludieron restricciones. Puedes pegar un enlace directo a un archivo multimedia público compatible, o reintentar más tarde.') from exc
+        if 'youtube' in url.lower() or 'youtube' in str(exc).lower() or 'sign in' in str(exc).lower() or 'bot' in str(exc).lower():
+            raise web.HTTPBadGateway(reason='YouTube no permitió analizar este enlace (verificación antibot/cookies). No se usaron cookies ni se eludió ninguna restricción. Puedes buscar alternativas públicas de música o probar otro enlace.') from exc
+        raise web.HTTPBadGateway(reason='No se pudo obtener metadata de este enlace. Verifica que sea público y vuelve a intentar.') from exc
+
+    formats = info.get('formats') or []
+    # Generic HTTP media URLs expose container metadata, not codec metadata.
+    # yt-dlp sets video_ext/audio_ext when its generic extractor recognizes the
+    # media stream; use those factual fields rather than inventing codecs.
+    has_video = any(
+        f.get('vcodec') not in (None, 'none') or f.get('video_ext') not in (None, 'none')
+        for f in formats
+    ) or info.get('vcodec') not in (None, 'none') or info.get('video_ext') not in (None, 'none')
+    has_audio = any(
+        f.get('acodec') not in (None, 'none') or f.get('audio_ext') not in (None, 'none')
+        for f in formats
+    ) or info.get('acodec') not in (None, 'none') or info.get('audio_ext') not in (None, 'none')
+    options = []
+    if has_video:
+        heights = sorted({f.get('height') for f in formats if (f.get('vcodec') not in (None, 'none') or f.get('video_ext') not in (None, 'none')) and isinstance(f.get('height'), int)})
+        options.append({'type': 'video', 'label': 'Video', 'qualities': heights})
+    if has_audio:
+        options.append({'type': 'audio', 'label': 'Audio'})
+    if info.get('subtitles') or info.get('automatic_captions'):
+        options.append({'type': 'captions', 'label': 'Subtítulos'})
+    if not options and info.get('thumbnail'):
+        options.append({'type': 'thumbnail', 'label': 'Miniatura'})
+    return web.Response(text=serializer.encode({
+        'url': url, 'title': info.get('title') or 'Sin título',
+        'thumbnail': info.get('thumbnail'), 'duration': info.get('duration'),
+        'uploader': info.get('uploader') or info.get('channel'), 'options': options,
+    }), content_type='application/json')
+
+
+@routes.post(config.URL_PREFIX + 'music-alternatives')
+async def music_alternatives(request):
+    """Identify a public music URL and search candidates; never download here."""
+    post = await _read_json_request(request)
+    source_url = post.get('url')
+    if not isinstance(source_url, str) or len(source_url) > 2048:
+        raise web.HTTPBadRequest(reason='Pega un enlace público de Spotify o YouTube Music.')
+    source_url = source_url.strip()
+    parsed = urlparse(source_url)
+    host = (parsed.hostname or '').lower()
+    title = str(post.get('title') or '').strip()[:200]
+    artist = str(post.get('artist') or '').strip()[:200]
+    if host == 'open.spotify.com':
+        normalized = _normalize_spotify_track_url(source_url)
+        if not normalized:
+            raise web.HTTPBadRequest(reason='El enlace de Spotify debe ser una canción (track) pública válida.')
+        source_url = normalized
+        oembed_endpoint = 'https://open.spotify.com/oembed'
+    elif host in ('music.youtube.com', 'www.youtube.com', 'youtube.com') and parsed.scheme == 'https':
+        if parsed.port not in (None, 443) or parsed.username or parsed.password or parsed.path != '/watch' or not parsed.query:
+            raise web.HTTPBadRequest(reason='Pega un enlace de canción pública de YouTube Music o YouTube.')
+        video_id = parse_qs(parsed.query).get('v', [''])[0]
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+            raise web.HTTPBadRequest(reason='El enlace no contiene un ID de video válido.')
+        source_url = f'https://www.youtube.com/watch?v={video_id}'
+        if not video_id:
+            raise web.HTTPBadRequest(reason='El enlace no contiene un ID de video válido.')
+        oembed_endpoint = 'https://www.youtube.com/oembed'
+    else:
+        raise web.HTTPBadRequest(reason='Pega un enlace de Spotify o YouTube Music público.')
+
+    if not title or not artist:
+        try:
+            data = await _public_oembed(source_url, oembed_endpoint)
+            public_title, public_artist = _music_query_from_public_metadata(data, allow_author=host != 'open.spotify.com')
+            title = title or public_title
+            artist = artist or public_artist
+            if host == 'open.spotify.com' and not artist and title:
+                artist = await _spotify_track_artist(source_url)
+        except Exception as exc:
+            log.info('Public music oEmbed unavailable for %s: %s', host, exc)
+
+    if not title:
+        return web.Response(text=serializer.encode({'results': [], 'needs_manual_metadata': True,
+            'error': 'No se pudieron obtener título y artista desde los metadatos públicos. Puedes introducirlos como último recurso.'}), content_type='application/json')
+    query = ' '.join(part for part in (artist, title) if part).strip()[:400]
+    try:
+        async with _MUSIC_SEARCH_LIMIT:
+            results = await asyncio.wait_for(asyncio.to_thread(_search_music_candidates, query), timeout=_MUSIC_SEARCH_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        raise web.HTTPGatewayTimeout(reason='La búsqueda musical tardó demasiado. Intenta de nuevo más tarde.') from exc
+    except Exception as exc:
+        log.info('Anonymous music candidate search failed: %s', exc)
+        return web.Response(text=serializer.encode({'results': [], 'track': {'title': title, 'artist': artist},
+            'query': query, 'error': 'No se pudo consultar la búsqueda pública de alternativas. Intenta más tarde.'}), content_type='application/json')
+    warning = 'Los candidatos pueden ser versiones, covers o remixes; revisa cada origen. No se inició ninguna descarga.'
+    return web.Response(text=serializer.encode({'track': {'title': title, 'artist': artist},
+        'results': results, 'query': query, 'warning': warning}), content_type='application/json')
+
+
 @routes.post(config.URL_PREFIX + 'add')
 async def add(request):
     log.info("Received request to add download")
@@ -1097,20 +1340,15 @@ async def upload_cookies(request):
     # Pair with the EJS remote components so YouTube JS challenges solve
     # on datacenter IPs. cookies alone are not enough in 2026.
     config._runtime_overrides.setdefault('remote_components', ['ejs:github'])
-    # Mirror YTDLnis's default player client selection. Cookies alone
-    # are still rate-limited on the 'web' client; web_safari and
-    # android_vr see much less aggressive throttling and fall back
-    # gracefully if one is blocked.
+    # mweb first because YouTube SABR streaming (Sep 2026) hides
+    # format URLs from web_safari. mweb still returns them.
     config._runtime_overrides.setdefault('extractor_args', {})
     yt_args = config._runtime_overrides['extractor_args']
     yt_args.setdefault('youtube', {})
-    # web_safari accepts cookies (essential for datacenter IPs); 'web'
-    # is a safe fallback. android_vr/ios/etc. don't accept cookies so
-    # we keep them out of the cookie-auth path.
-    yt_args['youtube'].setdefault('player_client', ['web_safari', 'web'])
+    yt_args['youtube'].setdefault('player_client', ['mweb', 'web_safari', 'web'])
     config._apply_runtime_overrides()
-    log.info(f'Cookies file uploaded ({size} bytes) (player_clients=web_safari,web)')
-    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes) — EJS solver armed + YTDLnis player clients, try again'}))
+    log.info(f'Cookies file uploaded ({size} bytes) (player_clients=mweb,web_safari,web)')
+    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes) — EJS solver armed + mweb-first player clients, try again'}))
 
 @routes.post(config.URL_PREFIX + 'delete-cookies')
 async def delete_cookies(request):

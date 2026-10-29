@@ -7,7 +7,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FontAwesomeModule } from '@fortawesome/angular-fontawesome';
 import { NgbModule, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
 import { NgSelectModule } from '@ng-select/ng-select';
-import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes } from '@fortawesome/free-solid-svg-icons';
+import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes, faExclamationTriangle } from '@fortawesome/free-solid-svg-icons';
 import { faGithub } from '@fortawesome/free-brands-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
 import { AddDownloadPayload, DownloadsService } from './services/downloads.service';
@@ -135,6 +135,16 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   expandedErrors: Set<string> = new Set<string>();
   cachedSortedDone: [string, Download][] = [];
   lastCopiedErrorId: string | null = null;
+  analysisState: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
+  analysedMedia?: { url: string; title: string; thumbnail?: string; duration?: number; uploader?: string; options: { type: string; label: string; qualities?: number[] }[] };
+  analysisError = '';
+  private analysedUrl = '';
+  alternativeSearchBusy = false;
+  showMusicFallback = false;
+  musicManualTitle = '';
+  musicManualArtist = '';
+  musicSearchWarning = '';
+  musicAlternativeResults: { title: string; artist: string; duration: number | null; platform: string; url: string }[] = [];
   private previousDownloadType = 'video';
   private addRequestSub?: Subscription;
   private liveCountdownTimer?: ReturnType<typeof setInterval>;
@@ -186,6 +196,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   faCopy = faCopy;
   faGithub = faGithub;
   faClock = faClock;
+  faExclamationTriangle = faExclamationTriangle;
   faTachometerAlt = faTachometerAlt;
   faSortAmountDown = faSortAmountDown;
   faSortAmountUp = faSortAmountUp;
@@ -571,6 +582,125 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       return false;
     }
     return this.cachedSubs.every(([id]) => this.selectedSubscriptionIds.has(id));
+  }
+
+  invalidateAnalysis(): void {
+    this.analysisState = 'idle';
+    this.analysedMedia = undefined;
+    this.analysedUrl = '';
+    this.analysisError = '';
+    this.cdr.markForCheck();
+  }
+
+  searchOptions(): void {
+    const url = (this.addUrl || '').trim();
+    if (!url) return;
+    const music = /^https:\/\/(?:open\.spotify\.com|music\.youtube\.com)\//i.test(url);
+    if (music) {
+      this.invalidateAnalysis();
+      this.searchMusicAlternatives();
+      return;
+    }
+    this.analyseUrl();
+  }
+
+  analyseUrl(): void {
+    const url = (this.addUrl || '').trim();
+    if (!url || this.analysisState === 'loading') return;
+    this.analysisState = 'loading';
+    this.analysedMedia = undefined;
+    this.musicAlternativeResults = [];
+    this.analysisError = '';
+    this.cdr.markForCheck();
+    this.downloads.analyse({ url }).pipe(takeUntilDestroyed(this.destroyRef)).subscribe(response => {
+      if (url !== (this.addUrl || '').trim()) return;
+      if ('status' in response && response.status === 'error') {
+        this.analysisState = 'error';
+        this.analysisError = response.msg || 'No se pudo analizar el enlace.';
+      } else {
+        this.analysedMedia = response as { url: string; title: string; thumbnail?: string; duration?: number; uploader?: string; options: { type: string; label: string; qualities?: number[] }[] };
+        this.analysedUrl = url;
+        this.analysisState = 'ready';
+      }
+      this.cdr.markForCheck();
+    });
+  }
+
+  selectAnalysedOption(type: string): void {
+    if (!this.analysedMedia?.options.some(option => option.type === type)) return;
+    this.downloadType = type;
+    this.downloadTypeChanged();
+  }
+
+  downloadDirect(): void {
+    if (!(this.addUrl || '').trim() || this.addInProgress || this.analysisState === 'loading') return;
+    this.downloadType = 'video';
+    this.downloadTypeChanged();
+    this.codec = 'auto';
+    this.format = 'auto';
+    this.quality = 'best';
+    this.addDownload();
+  }
+
+  confirmDownload(): void {
+    if (this.analysisState !== 'ready' || this.analysedUrl !== (this.addUrl || '').trim()) return;
+    this.addDownload();
+  }
+
+  searchMusicAlternatives(): void {
+    const url = (this.addUrl || '').trim();
+    if (!url) {
+      this.toasts.error('Pega un enlace público de Spotify o YouTube Music.');
+      return;
+    }
+    this.alternativeSearchBusy = true;
+    this.analysisState = 'loading';
+    this.musicSearchWarning = '';
+    this.musicAlternativeResults = [];
+    this.showMusicFallback = false;
+    this.downloads.searchMusicAlternatives({ url }).pipe(
+      takeUntilDestroyed(this.destroyRef),
+      finalize(() => {
+        this.alternativeSearchBusy = false;
+        this.analysisState = 'idle';
+        this.cdr.markForCheck();
+      }),
+    ).subscribe(result => {
+      const response = result as {
+        results?: { title: string; artist: string; duration: number | null; platform: string; url: string }[];
+        warning?: string;
+        needs_manual_metadata?: boolean;
+        track?: { title: string; artist: string };
+        error?: string;
+        msg?: string;
+      };
+      this.musicSearchWarning = response.error || response.warning || response.msg || '';
+      this.musicAlternativeResults = response.results || [];
+      if (response.track?.title) this.musicManualTitle = response.track.title;
+      if (response.track?.artist) this.musicManualArtist = response.track.artist;
+      this.showMusicFallback = !!response.needs_manual_metadata || (!this.musicAlternativeResults.length && !response.error && !response.msg);
+      this.cdr.markForCheck();
+    });
+  }
+
+  downloadMusicAlternative(url: string): void {
+    if (!this.musicAlternativeResults.some(result => result.url === url)) return;
+    this.addUrl = url;
+    this.downloadType = 'audio';
+    this.addDownload();
+  }
+
+  searchManualMusicAlternatives(): void {
+    this.downloads.searchMusicAlternatives({
+      url: (this.addUrl || '').trim(),
+      title: this.musicManualTitle,
+      artist: this.musicManualArtist,
+    }).pipe(takeUntilDestroyed(this.destroyRef)).subscribe(result => {
+      const response = result as { results?: { title: string; artist: string; duration: number | null; platform: string; url: string }[]; warning?: string; error?: string; msg?: string };
+      this.musicAlternativeResults = response.results || [];
+      this.musicSearchWarning = response.warning || response.error || response.msg || '';
+      this.cdr.markForCheck();
+    });
   }
 
   addSubscription() {

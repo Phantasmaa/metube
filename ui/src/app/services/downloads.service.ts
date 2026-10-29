@@ -136,6 +136,31 @@ export class DownloadsService {
     return of({ status: 'error', msg });
   }
 
+  public analyse(payload: { url: string }) {
+    return this.http.post<{
+      url: string; title: string; thumbnail?: string; duration?: number; uploader?: string;
+      options: { type: string; label: string; qualities?: number[] }[];
+    }>('analyse', payload).pipe(catchError((error: HttpErrorResponse) => {
+      const youtube = /^https?:\/\/(?:music\.|www\.)?(?:youtube\.com|youtu\.be)\//i.test(payload.url);
+      if (youtube && error.status === 502) {
+        return of({ status: 'error', msg: 'No se pudo analizar este enlace de YouTube. El servidor no pudo obtener sus datos; puede deberse al bloqueo antibot. Para música, usa Buscar alternativas. No se inició ninguna descarga.' });
+      }
+      if (payload.url.startsWith('https://open.spotify.com/') && error.status === 502) {
+        return of({ status: 'error', msg: 'No se pudo obtener metadata pública de Spotify. Revisa que el enlace de canción sea público; como último recurso introduce título y artista. No se inició descarga.' });
+      }
+      return this.handleHTTPError(error);
+    }));
+  }
+
+  public searchMusicAlternatives(payload: { url: string; title?: string; artist?: string }) {
+    return this.http.post<{
+      results: { title: string; artist: string; duration: number | null; platform: string; url: string }[];
+      warning?: string;
+      needs_manual_metadata?: boolean;
+      error?: string;
+    }>('music-alternatives', payload).pipe(catchError(this.handleHTTPError));
+  }
+
   public add(payload: AddDownloadPayload) {
     const body: Record<string, unknown> = {
       url: payload.url,

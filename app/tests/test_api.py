@@ -409,3 +409,163 @@ async def test_download_blocks_state_dir_files(monkeypatch):
         (download_dir / "video.mp4").unlink(missing_ok=True)
         (download_dir / percent_filename).unlink(missing_ok=True)
         state_dir.rmdir()
+
+
+@pytest.mark.asyncio
+async def test_analyse_returns_real_format_options_without_downloading(monkeypatch):
+    called = {}
+    class FakeYDL:
+        def __init__(self, opts):
+            called['opts'] = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False):
+            called.update(url=url, download=download)
+            return {'title': 'Real clip', 'duration': 42, 'thumbnail': 'https://cdn.example/thumb.jpg',
+                    'formats': [{'format_id': '18', 'ext': 'mp4', 'height': 360, 'vcodec': 'avc1', 'acodec': 'mp4a'},
+                                {'format_id': '140', 'ext': 'm4a', 'vcodec': 'none', 'acodec': 'aac'}]}
+    monkeypatch.setattr(main, 'YoutubeDL', FakeYDL)
+    monkeypatch.setattr(main, 'validate_url', lambda url, allow_private=False: None)
+    resp = await main.analyse(_json_request({'url': 'https://example.com/video'}))
+    data = json.loads(resp.text)
+    assert data['title'] == 'Real clip'
+    assert {item['type'] for item in data['options']} == {'video', 'audio'}
+    assert called['download'] is False
+    assert called['opts']['cookiefile'] is None
+
+
+@pytest.mark.asyncio
+async def test_analyse_generic_mp4_infers_video_from_real_format_ext(monkeypatch):
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False):
+            return {'title': 'flower', 'formats': [{'format_id': '0', 'ext': 'mp4', 'video_ext': 'mp4', 'audio_ext': 'none'}]}
+    monkeypatch.setattr(main, 'YoutubeDL', FakeYDL)
+    monkeypatch.setattr(main, 'validate_url', lambda url, allow_private=False: None)
+    response = await main.analyse(_json_request({'url': 'https://example.com/flower.mp4'}))
+    assert 'video' in {option['type'] for option in json.loads(response.text)['options']}
+
+
+@pytest.mark.asyncio
+async def test_analyse_rejects_invalid_url_without_extractor(monkeypatch):
+    monkeypatch.setattr(main, 'validate_url', lambda url, allow_private=False: 'blocked')
+    monkeypatch.setattr(main, 'YoutubeDL', lambda *_: pytest.fail('extractor must not run'))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.analyse(_json_request({'url': 'https://127.0.0.1/private'}))
+
+
+@pytest.mark.asyncio
+async def test_music_alternatives_search_uses_anonymous_scsearch(monkeypatch):
+    called = {'queries': []}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            called['opts'] = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, query, download=False):
+            called['queries'].append(query)
+            if query.startswith('scsearch8:'):
+                called['download'] = download
+                return {'entries': [{
+                    'title': 'Track (cover)', 'uploader': 'Artist', 'duration': 123,
+                    'webpage_url': 'https://soundcloud.com/a/track', 'extractor_key': 'Soundcloud',
+                }]}
+            raise RuntimeError('metadata unavailable')
+
+    monkeypatch.setattr(main, 'YoutubeDL', FakeYDL, raising=False)
+    req = _json_request({'url': 'https://music.youtube.com/watch?v=abcdefghijk', 'title': 'Track', 'artist': 'Artist'})
+    resp = await main.music_alternatives(req)
+    data = json.loads(resp.text)
+    # Manual metadata avoids an unnecessary blocked YouTube request.
+    assert called['queries'] == ['scsearch8:Artist Track']
+    assert called['download'] is False
+    assert called['opts']['cookiefile'] is None
+    assert data['results'][0]['platform'] == 'SoundCloud'
+    assert data['results'][0]['url'] == 'https://soundcloud.com/a/track'
+
+
+@pytest.mark.asyncio
+async def test_music_alternatives_manual_query_when_source_metadata_unavailable(monkeypatch):
+    class FakeYDL:
+        def __init__(self, opts): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def extract_info(self, query, download=False):
+            assert query == 'scsearch8:Manual Artist Manual Title'
+            return {'entries': []}
+
+    monkeypatch.setattr(main, 'YoutubeDL', FakeYDL, raising=False)
+    req = _json_request({'url': 'https://music.youtube.com/watch?v=abcdefghijk', 'title': 'Manual Title', 'artist': 'Manual Artist'})
+    resp = await main.music_alternatives(req)
+    assert json.loads(resp.text)['results'] == []
+
+
+@pytest.mark.asyncio
+async def test_spotify_alternatives_reads_public_oembed_and_normalizes_locale(monkeypatch):
+    calls = {}
+    class Response:
+        status = 200
+        def raise_for_status(self): pass
+        async def json(self, content_type=None): return {"title": "Real Song", "author_name": "Spotify"}
+    class Client:
+        def __init__(self, **kwargs): calls['timeout'] = kwargs.get('timeout')
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def get(self, url, **kwargs):
+            calls.update(url=url, kwargs=kwargs)
+            class RequestContext:
+                async def __aenter__(self): return Response()
+                async def __aexit__(self, *args): pass
+            return RequestContext()
+    monkeypatch.setattr(main, 'aiohttp', type('Aiohttp', (), {'ClientSession': Client, 'ClientTimeout': lambda **kwargs: kwargs}), raising=False)
+    monkeypatch.setattr(main, 'YoutubeDL', lambda *_: pytest.fail('metadata from oEmbed should avoid source extraction'), raising=False)
+    async def public_artist(url): return 'Real Artist'
+    monkeypatch.setattr(main, '_spotify_track_artist', public_artist)
+    monkeypatch.setattr(main, '_search_music_candidates', lambda query: [], raising=False)
+    resp = await main.music_alternatives(_json_request({'url': 'https://open.spotify.com/intl-es/track/5pS1hoVW3gYiqE54R04Egg'}))
+    data = json.loads(resp.text)
+    assert calls['url'] == 'https://open.spotify.com/oembed'
+    assert calls['kwargs']['params']['url'] == 'https://open.spotify.com/track/5pS1hoVW3gYiqE54R04Egg'
+    assert data['track']['title'] == 'Real Song' and data['track']['artist'] == 'Real Artist'
+    assert data['query'] == 'Real Artist Real Song'
+
+
+@pytest.mark.asyncio
+async def test_music_alternatives_youtube_oembed_then_searches_without_download(monkeypatch):
+    calls = {}
+    class Response:
+        status_code = 200
+        status = 200
+        def raise_for_status(self): pass
+        async def json(self, content_type=None): return {'title': 'Actual Track — Actual Artist', 'author_name': 'Actual Artist'}
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def get(self, url, **kwargs):
+            calls['oembed_url'] = url
+            class RequestContext:
+                async def __aenter__(self): return Response()
+                async def __aexit__(self, *args): pass
+            return RequestContext()
+    monkeypatch.setattr(main, 'aiohttp', type('Aiohttp', (), {'ClientSession': Client, 'ClientTimeout': lambda **kwargs: kwargs}), raising=False)
+    def search(query): calls['query'] = query; return [{'title': 'candidate'}]
+    monkeypatch.setattr(main, '_search_music_candidates', search, raising=False)
+    resp = await main.music_alternatives(_json_request({'url': 'https://music.youtube.com/watch?v=Ka8GThTy5Lc'}))
+    data = json.loads(resp.text)
+    assert calls['oembed_url'] == 'https://www.youtube.com/oembed'
+    assert calls['query'] == 'Actual Artist Actual Track'
+    assert data['results'] == [{'title': 'candidate'}]
